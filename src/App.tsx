@@ -2,10 +2,10 @@ import { useEffect, useState } from "react";
 import { openDb } from "./db/db";
 import { getSociety, Society } from "./db/services";
 import { makeT, Lang } from "./lib/i18n";
-import { Setup, Dashboard, FlatsScreen, BillingScreen, BackupScreen, RulesScreen } from "./screens";
+import { Setup, Dashboard, FlatsScreen, BillingScreen, BackupScreen, RulesScreen, ExpensesScreen } from "./screens";
 
-type Tab = "dashboard" | "flats" | "billing" | "rules" | "backup";
-const TABS: Tab[] = ["dashboard", "flats", "billing", "rules", "backup"];
+type Tab = "dashboard" | "flats" | "billing" | "expenses" | "rules" | "backup";
+const TABS: Tab[] = ["dashboard", "flats", "billing", "expenses", "rules", "backup"];
 
 export default function App() {
   const [ready, setReady] = useState(false);
@@ -42,10 +42,11 @@ export default function App() {
         <Setup t={t} onDone={refresh} />
       ) : (
         <>
-          <main key={version}>
+          <main data-v={version}>
             {tab === "dashboard" && <Dashboard t={t} society={society} />}
             {tab === "flats" && <FlatsScreen t={t} society={society} onChange={refresh} />}
             {tab === "billing" && <BillingScreen t={t} society={society} onChange={refresh} />}
+            {tab === "expenses" && <ExpensesScreen t={t} society={society} onChange={refresh} />}
             {tab === "rules" && <RulesScreen t={t} society={society} onChange={refresh} />}
             {tab === "backup" && <BackupScreen t={t} onRestored={refresh} />}
           </main>

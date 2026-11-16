@@ -3,7 +3,7 @@ import type { Key } from "./lib/i18n";
 import { MONTHS_EN, rupees, toPaise, today } from "./lib/format";
 import { PenaltyConfig } from "./lib/penalty";
 import {
-  addFlat, createSociety, dashboard, generateBills, listBills, listFlats, recordPayment, updatePenaltyRules, Society, BillView,
+  addExpense, addFlat, createSociety, dashboard, decideExpense, EXPENSE_CATEGORIES, expenseSummary, listExpenses, reverseExpense, generateBills, listBills, listFlats, recordPayment, updatePenaltyRules, Society, BillView,
 } from "./db/services";
 import { exportBytes, restoreBytes, safetyCopyExists, undoRestore } from "./db/db";
 import { decodeBackup, encodeBackup } from "./lib/backup";
@@ -95,6 +95,7 @@ export function Dashboard({ t, society }: { t: T; society: Society }) {
   const stats: [Key, string][] = [
     ["total_flats", String(d.flats)], ["occupied", String(d.occupied)], ["vacant", String(d.vacant)],
     ["billed", rupees(d.billed)], ["collected", rupees(d.collected)], ["pending", rupees(d.pending)], ["penalty", rupees(d.penalty)],
+    ["total_expenses", rupees(d.expenses)], ["pending_expenses", String(d.pendingExpenses)], ["net", rupees(d.net)],
   ];
   return (
     <>
@@ -242,5 +243,104 @@ export function BackupScreen({ t, onRestored }: { t: T; onRestored: () => void }
         {canUndo && <button className="btn ghost" onClick={async () => { try { await undoRestore(); setN({ kind: "ok", text: t("undone") }); onRestored(); } catch (e) { setN({ kind: "err", text: errText(e) }); } }}>{t("undo")}</button>}
       </p>
     </section>
+  );
+}
+
+const EXPENSE_MODES = ["cash", "upi", "cheque", "neft_rtgs", "bank_transfer", "card", "other"] as Key[];
+const STATUS_CLASS = { approved: "paid", pending: "partial", rejected: "unpaid" } as const;
+const STATUS_KEY = { approved: "st_approved", pending: "st_pending", rejected: "st_rejected" } as const;
+
+export function ExpensesScreen({ t, society, onChange }: { t: T; society: Society; onChange: () => void }) {
+  const blank = { date: today(), category: EXPENSE_CATEGORIES[0] as string, description: "", vendor: "", invoiceNo: "", amount: "", mode: "cash", reference: "" };
+  const [f, setF] = useState(blank);
+  const [y, setY] = useState(now.getFullYear()); const [m, setM] = useState(now.getMonth() + 1); const [cat, setCat] = useState("");
+  const [approver, setApprover] = useState(localStorage.getItem("approver") || "");
+  const [reversing, setReversing] = useState<number | null>(null); const [reason, setReason] = useState("");
+  const [n, setN] = useState<Notice>(null);
+  const rows = listExpenses(society.id, y, m, cat);
+  const sum = expenseSummary(society.id, y, m);
+  const set = (k: keyof typeof blank) => (e: { target: { value: string } }) => setF({ ...f, [k]: e.target.value });
+  const catName = (c: string) => t(`cat_${c}` as Key);
+
+  const add = async () => {
+    try {
+      await addExpense(society, { date: f.date, category: f.category, description: f.description, vendor: f.vendor, invoiceNo: f.invoiceNo, amountPaise: toPaise(f.amount), mode: f.mode, reference: f.reference });
+      setF({ ...blank, date: f.date }); setN({ kind: "ok", text: t("expense_saved") }); onChange();
+    } catch (e) { setN({ kind: "err", text: errText(e) }); }
+  };
+  const decide = async (id: number, d: "approved" | "rejected") => {
+    try { localStorage.setItem("approver", approver); await decideExpense(id, d, approver); setN(null); onChange(); }
+    catch (e) { setN({ kind: "err", text: errText(e) }); }
+  };
+  const reverse = async () => {
+    if (reversing === null) return;
+    try { await reverseExpense(reversing, reason, approver); setReversing(null); setReason(""); setN(null); onChange(); }
+    catch (e) { setN({ kind: "err", text: errText(e) }); }
+  };
+
+  return (
+    <>
+      <section className="card"><h2>{t("add_expense")}</h2><Msg n={n} />
+        <div className="row">
+          <label>{t("expense_date")}<input type="date" value={f.date} onChange={set("date")} /></label>
+          <label>{t("category")}<select value={f.category} onChange={set("category")}>{EXPENSE_CATEGORIES.map((c) => <option key={c} value={c}>{catName(c)}</option>)}</select></label>
+          <label>{t("amount")}<input inputMode="decimal" value={f.amount} onChange={set("amount")} /></label>
+          <label>{t("vendor")}<input value={f.vendor} onChange={set("vendor")} /></label>
+          <label>{t("invoice_no")}<input value={f.invoiceNo} onChange={set("invoiceNo")} /></label>
+          <label>{t("mode")}<select value={f.mode} onChange={set("mode")}>{EXPENSE_MODES.map((k) => <option key={k} value={k}>{t(k)}</option>)}</select></label>
+          <label>{t("reference")}<input value={f.reference} onChange={set("reference")} /></label>
+          <label>{t("description")}<input value={f.description} onChange={set("description")} /></label>
+          <button className="btn" onClick={add}>{t("add_expense")}</button>
+        </div>
+      </section>
+
+      <section className="card">
+        <div className="row">
+          <label>{t("month")}<select value={m} onChange={(e) => setM(+e.target.value)}>
+            <option value={0}>{t("all_months")}</option>{MONTHS_EN.map((x, i) => <option key={x} value={i + 1}>{x}</option>)}</select></label>
+          <label>{t("year")}<input type="number" value={y} onChange={(e) => setY(+e.target.value)} /></label>
+          <label>{t("category")}<select value={cat} onChange={(e) => setCat(e.target.value)}>
+            <option value="">{t("all_categories")}</option>{EXPENSE_CATEGORIES.map((c) => <option key={c} value={c}>{catName(c)}</option>)}</select></label>
+          <label>{t("approver_name")}<input value={approver} onChange={(e) => setApprover(e.target.value)} /></label>
+        </div>
+        <div className="grid" style={{ marginTop: 12 }}>
+          <div className="stat"><b>{rupees(sum.total)}</b><span>{t("total_expenses")}</span></div>
+          <div className="stat"><b>{sum.pendingCount} · {rupees(sum.pendingTotal)}</b><span>{t("pending_expenses")}</span></div>
+        </div>
+        {sum.byCategory.length > 0 && (
+          <div className="scroll" style={{ marginTop: 12 }}><table><thead><tr><th>{t("by_category")}</th><th className="num">{t("amount")}</th></tr></thead>
+            <tbody>{sum.byCategory.map((r) => <tr key={r.category}><td>{catName(r.category)}</td><td className="num">{rupees(r.total)}</td></tr>)}</tbody></table></div>
+        )}
+      </section>
+
+      {reversing !== null && (
+        <section className="card"><h2>{t("reverse")}</h2>
+          <div className="row"><label>{t("reverse_reason")}<input value={reason} onChange={(e) => setReason(e.target.value)} /></label>
+            <button className="btn" onClick={reverse}>{t("confirm_reverse")}</button>
+            <button className="btn ghost" onClick={() => { setReversing(null); setReason(""); }}>{t("cancel")}</button></div>
+        </section>
+      )}
+
+      <section className="card">
+        {rows.length === 0 ? <p className="muted">{t("no_expenses")}</p> : (
+          <div className="scroll"><table>
+            <thead><tr><th>{t("expense_date")}</th><th>{t("voucher")}</th><th>{t("category")}</th><th>{t("vendor")}</th><th>{t("description")}</th><th className="num">{t("amount")}</th><th>{t("status")}</th><th>{t("approved_by")}</th><th></th></tr></thead>
+            <tbody>{rows.map((r) => (
+              <tr key={r.id}>
+                <td>{r.txn_date}</td><td>{r.voucher_no ?? "—"}</td><td>{catName(r.category)}</td><td>{r.vendor_name ?? ""}</td>
+                <td style={{ whiteSpace: "normal", minWidth: 140 }}>{r.description}{r.invoice_no ? ` (${r.invoice_no})` : ""}</td>
+                <td className="num">{rupees(r.amount_paise)}</td>
+                <td><span className={`tag ${STATUS_CLASS[r.approval]}`}>{t(STATUS_KEY[r.approval])}</span>{r.reversed ? <> <span className="tag unpaid">{t("reversed_tag")}</span></> : null}</td>
+                <td>{r.approved_by}</td>
+                <td>
+                  {r.approval === "pending" && <span className="row" style={{ flexWrap: "nowrap" }}>
+                    <button className="btn ghost" onClick={() => decide(r.id, "approved")}>{t("approve")}</button>
+                    <button className="btn ghost" onClick={() => decide(r.id, "rejected")}>{t("reject")}</button></span>}
+                  {r.approval === "approved" && !r.reversed && r.reverses_id === null && <button className="btn ghost" onClick={() => setReversing(r.id)}>{t("reverse")}</button>}
+                </td>
+              </tr>))}</tbody></table></div>
+        )}
+      </section>
+    </>
   );
 }
