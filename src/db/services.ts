@@ -174,7 +174,9 @@ export function dashboard(s: Society, year: number, month: number) {
     "SELECT COUNT(*) AS n, SUM(CASE WHEN occupancy='vacant' THEN 0 ELSE 1 END) AS occ FROM flats WHERE society_id=? AND active=1", [s.id])!;
   const billed = bills.reduce((a, b) => a + b.total, 0);
   const collected = bills.reduce((a, b) => a + b.paid, 0);
+  const ex = expenseSummary(s.id, year, month);
   return {
+    expenses: ex.total, pendingExpenses: ex.pendingCount, net: collected - ex.total,
     flats: flats.n, occupied: flats.occ ?? 0, vacant: flats.n - (flats.occ ?? 0),
     billed, collected, pending: billed - collected,
     penalty: bills.reduce((a, b) => a + b.penalty, 0),
@@ -182,4 +184,100 @@ export function dashboard(s: Society, year: number, month: number) {
     paidFlats: bills.filter((b) => b.status === "paid").length, billCount: bills.length,
     defaulters: bills.filter((b) => b.overdue),
   };
+}
+
+// ---------------------------------------------------------------- Expenses
+
+export const EXPENSE_CATEGORIES = [
+  "Electricity", "Water Supply", "Lift Maintenance", "Security", "Housekeeping", "Gardening", "Plumbing", "Repairs",
+  "Staff Salary", "Insurance", "Property Tax", "Administrative Expenses", "Festival Expenses", "Other Expenses",
+] as const;
+
+export interface ExpenseRow {
+  id: number; txn_date: string; voucher_no: string | null; category: string; description: string | null;
+  vendor_name: string | null; invoice_no: string | null; amount_paise: number; mode: string | null; reference: string | null;
+  approval: "pending" | "approved" | "rejected"; approved_by: string | null; reverses_id: number | null; reversed: number;
+}
+
+/** month = 0 means the whole year. */
+function dateRange(year: number, month: number): [string, string] {
+  const p = (n: number) => String(n).padStart(2, "0");
+  if (month === 0) return [`${year}-01-01`, `${year + 1}-01-01`];
+  return month === 12 ? [`${year}-12-01`, `${year + 1}-01-01`] : [`${year}-${p(month)}-01`, `${year}-${p(month + 1)}-01`];
+}
+
+export function listExpenses(societyId: number, year: number, month: number, category: string): ExpenseRow[] {
+  const [from, to] = dateRange(year, month);
+  return all<ExpenseRow>(
+    `SELECT e.*, v.name AS vendor_name,
+            EXISTS (SELECT 1 FROM income_expense r WHERE r.reverses_id = e.id) AS reversed
+     FROM income_expense e LEFT JOIN vendors v ON v.id = e.vendor_id
+     WHERE e.society_id=? AND e.kind='expense' AND e.txn_date >= ? AND e.txn_date < ? AND (?='' OR e.category=?)
+     ORDER BY e.txn_date DESC, e.id DESC`, [societyId, from, to, category, category]);
+}
+
+export interface ExpenseInput {
+  date: string; category: string; description: string; vendor: string; invoiceNo: string;
+  amountPaise: number; mode: string; reference: string;
+}
+
+export async function addExpense(s: Society, d: ExpenseInput): Promise<string> {
+  if (!(d.amountPaise > 0)) throw new Error("Enter an amount greater than zero.");
+  if (!d.date) throw new Error("Choose the expense date.");
+  let voucher = "";
+  tx(() => {
+    let vendorId: number | null = null;
+    const name = d.vendor.trim();
+    if (name) {
+      const v = one<{ id: number }>("SELECT id FROM vendors WHERE society_id=? AND LOWER(name)=LOWER(?)", [s.id, name]);
+      if (v) vendorId = v.id;
+      else { run("INSERT INTO vendors (society_id, name) VALUES (?,?)", [s.id, name]); vendorId = lastId(); }
+    }
+    const seq = one<{ n: number }>("SELECT COUNT(*) AS n FROM income_expense WHERE society_id=? AND voucher_no IS NOT NULL", [s.id])!.n + 1;
+    voucher = `V${d.date.slice(0, 4)}-${String(seq).padStart(5, "0")}`;
+    run(`INSERT INTO income_expense (society_id, kind, txn_date, voucher_no, category, description, vendor_id, invoice_no, amount_paise, mode, reference, approval)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [s.id, "expense", d.date, voucher, d.category, d.description.trim(), vendorId, d.invoiceNo.trim(), d.amountPaise, d.mode, d.reference.trim(), "pending"]);
+    audit("expense_add", "expense", lastId(), `${voucher} ${d.category} ${d.amountPaise}`);
+  });
+  await save();
+  return voucher;
+}
+
+export async function decideExpense(id: number, decision: "approved" | "rejected", by: string) {
+  if (!by.trim()) throw new Error("Enter the name of the person approving.");
+  tx(() => {
+    run("UPDATE income_expense SET approval=?, approved_by=? WHERE id=? AND kind='expense' AND approval='pending'", [decision, by.trim(), id]);
+    if (all("SELECT changes() AS c")[0].c !== 1) throw new Error("This expense has already been decided.");
+    audit(decision === "approved" ? "expense_approve" : "expense_reject", "expense", id, by.trim());
+  });
+  await save();
+}
+
+/** Expenses are never deleted. A wrong approved entry is cancelled by a matching negative entry. */
+export async function reverseExpense(id: number, reason: string, by: string) {
+  if (!reason.trim()) throw new Error("Enter the reason for the reversal.");
+  tx(() => {
+    const e = one<{ society_id: number; voucher_no: string; category: string; amount_paise: number; approval: string; reverses_id: number | null }>(
+      "SELECT * FROM income_expense WHERE id=? AND kind='expense'", [id]);
+    if (!e) throw new Error("Expense not found.");
+    if (e.approval !== "approved" || e.reverses_id !== null) throw new Error("Only an approved expense can be reversed.");
+    run(`INSERT INTO income_expense (society_id, kind, txn_date, category, description, amount_paise, reverses_id, approval, approved_by)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
+      [e.society_id, "expense", today(), e.category, `Reversal of ${e.voucher_no}: ${reason.trim()}`, -e.amount_paise, id, "approved", by.trim() || "admin"]);
+    audit("expense_reverse", "expense", id, reason.trim());
+  });
+  await save();
+}
+
+export function expenseSummary(societyId: number, year: number, month: number) {
+  const [from, to] = dateRange(year, month);
+  const byCategory = all<{ category: string; total: number }>(
+    `SELECT category, SUM(amount_paise) AS total FROM income_expense
+     WHERE society_id=? AND kind='expense' AND approval='approved' AND txn_date >= ? AND txn_date < ?
+     GROUP BY category ORDER BY total DESC`, [societyId, from, to]);
+  const pending = one<{ n: number; total: number }>(
+    `SELECT COUNT(*) AS n, COALESCE(SUM(amount_paise),0) AS total FROM income_expense
+     WHERE society_id=? AND kind='expense' AND approval='pending' AND txn_date >= ? AND txn_date < ?`, [societyId, from, to])!;
+  return { byCategory, total: byCategory.reduce((a, r) => a + r.total, 0), pendingCount: pending.n, pendingTotal: pending.total };
 }

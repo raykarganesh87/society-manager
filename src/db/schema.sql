@@ -130,3 +130,11 @@ CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON audit_log
 BEGIN SELECT RAISE(ABORT, 'Audit log is read-only.'); END;
 
 INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1');
+
+-- Expense / ledger protections (added in version 1.1)
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ie_voucher ON income_expense (society_id, voucher_no) WHERE voucher_no IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_ie_reversal ON income_expense (reverses_id) WHERE reverses_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS ix_ie_date ON income_expense (society_id, kind, txn_date);
+-- Only the approval status may change on a ledger row. Amount, date, category and so on are fixed once saved.
+CREATE TRIGGER IF NOT EXISTS ledger_fixed_fields BEFORE UPDATE OF kind, txn_date, voucher_no, category, description, vendor_id, invoice_no, amount_paise, mode, reference, reverses_id ON income_expense
+BEGIN SELECT RAISE(ABORT, 'Expense details cannot be edited. Reverse the entry and add a new one.'); END;
