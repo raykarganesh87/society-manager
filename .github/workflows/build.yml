@@ -54,7 +54,7 @@ jobs:
             --ks-pass pass:"$KEYSTORE_PASSWORD" --key-pass pass:"$KEY_PASSWORD" \
             --out out/SocietyManager-release.apk aligned.apk
           rm -f release.keystore
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with: { name: android-apk, path: out/*.apk }
 
   windows:
@@ -66,5 +66,5 @@ jobs:
         with: { node-version: 20 }
       - run: npm install
       - run: npm run dist:win
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with: { name: windows-installer, path: release/*.exe }
