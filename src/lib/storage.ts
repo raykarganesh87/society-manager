@@ -38,9 +38,7 @@ export async function readFile(name: string): Promise<Uint8Array | null> {
       return null;
     }
   }
-  // Plain browser (development only): keep the file in localStorage.
-  const v = localStorage.getItem("dev:" + name);
-  return v ? fromBase64(v) : null;
+  return idbGet(name); // plain browser: the single-file version
 }
 
 export async function writeFile(name: string, bytes: Uint8Array): Promise<void> {
@@ -49,12 +47,47 @@ export async function writeFile(name: string, bytes: Uint8Array): Promise<void> 
     await Filesystem.writeFile({ path: name, directory: Directory.Data, data: toBase64(bytes) });
     return;
   }
-  localStorage.setItem("dev:" + name, toBase64(bytes));
+  await idbPut(name, bytes);
+}
+
+// ---- Browser storage (IndexedDB) for the single-file version ----
+function idb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const r = indexedDB.open("society-manager", 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("files");
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+}
+async function idbGet(name: string): Promise<Uint8Array | null> {
+  try { await navigator.storage?.persist?.(); } catch { /* ignore */ }
+  const db = await idb();
+  return new Promise((resolve, reject) => {
+    const q = db.transaction("files").objectStore("files").get(name);
+    q.onsuccess = () => resolve(q.result ? new Uint8Array(q.result as ArrayBuffer) : null);
+    q.onerror = () => reject(q.error);
+  });
+}
+async function idbPut(name: string, bytes: Uint8Array): Promise<void> {
+  const db = await idb();
+  return new Promise((resolve, reject) => {
+    const t = db.transaction("files", "readwrite");
+    t.objectStore("files").put(bytes.slice().buffer, name);
+    t.oncomplete = () => resolve();
+    t.onerror = () => reject(t.error);
+  });
 }
 
 export async function copyText(text: string): Promise<void> {
   if (isNative()) await Clipboard.write({ string: text });
-  else await navigator.clipboard.writeText(text);
+  else if (navigator.clipboard && window.isSecureContext) await navigator.clipboard.writeText(text);
+  else {
+    const ta = document.createElement("textarea");
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    if (!ok) throw new Error("Copy is not allowed here. Use Save backup file instead.");
+  }
 }
 
 /** Save a backup file: share sheet on Android, "Save as" dialog on Windows, download in a browser. */
