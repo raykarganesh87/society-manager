@@ -1,14 +1,14 @@
 import { all, one, run, tx, lastId, save } from "./db";
 import { calculatePenalty, dueDateFor, PenaltyConfig } from "../lib/penalty";
-import { today } from "../lib/format";
+import { today, MONTHS_EN } from "../lib/format";
 
 export interface Society {
-  id: number; name: string; due_day: number;
+  id: number; name: string; city: string | null; due_day: number;
   penalty_method: PenaltyConfig["method"]; penalty_rate: number; penalty_grace_days: number;
   penalty_max_paise: number | null; penalty_effective_from: string;
 }
 export interface Flat {
-  id: number; building: string; flat_no: string; owner_name: string; mobile: string | null;
+  id: number; building: string; flat_no: string; owner_name: string; mobile: string | null; whatsapp: string | null;
   occupancy: string; monthly_maintenance_paise: number; penalty_exempt: number;
 }
 
@@ -47,10 +47,10 @@ export const listFlats = (societyId: number, q: string) => {
      ORDER BY building, CAST(flat_no AS INTEGER), flat_no`, [societyId, like, like, like]);
 };
 
-export async function addFlat(societyId: number, d: { building: string; flat_no: string; owner_name: string; mobile: string; occupancy: string; maintenance_paise: number }) {
+export async function addFlat(societyId: number, d: { building: string; flat_no: string; owner_name: string; mobile: string; whatsapp: string; occupancy: string; maintenance_paise: number }) {
   tx(() => {
-    run("INSERT INTO flats (society_id, building, flat_no, owner_name, mobile, occupancy, monthly_maintenance_paise) VALUES (?,?,?,?,?,?,?)",
-      [societyId, d.building.trim(), d.flat_no.trim(), d.owner_name.trim(), d.mobile.trim(), d.occupancy, d.maintenance_paise]);
+    run("INSERT INTO flats (society_id, building, flat_no, owner_name, mobile, whatsapp, occupancy, monthly_maintenance_paise) VALUES (?,?,?,?,?,?,?,?)",
+      [societyId, d.building.trim(), d.flat_no.trim(), d.owner_name.trim(), d.mobile.trim(), d.whatsapp.trim(), d.occupancy, d.maintenance_paise]);
     const id = lastId();
     run("INSERT INTO ownership_history (flat_id, owner_name, from_date) VALUES (?,?,?)", [id, d.owner_name.trim(), today()]);
     audit("create", "flat", id, `${d.building} ${d.flat_no}`);
@@ -281,3 +281,189 @@ export function expenseSummary(societyId: number, year: number, month: number) {
      WHERE society_id=? AND kind='expense' AND approval='pending' AND txn_date >= ? AND txn_date < ?`, [societyId, from, to])!;
   return { byCategory, total: byCategory.reduce((a, r) => a + r.total, 0), pendingCount: pending.n, pendingTotal: pending.total };
 }
+
+// ---------------------------------------------------------------- Editing
+
+const diff = (before: Record<string, unknown>, after: Record<string, unknown>) =>
+  JSON.stringify(Object.fromEntries(Object.keys(after).filter((k) => before[k] !== after[k]).map((k) => [k, { from: before[k], to: after[k] }])));
+
+export async function updateSociety(s: Society, d: { name: string; city: string; dueDay: number }) {
+  if (!d.name.trim()) throw new Error("Enter the society name.");
+  if (!(d.dueDay >= 1 && d.dueDay <= 28)) throw new Error("Due day must be between 1 and 28.");
+  tx(() => {
+    const before = one<Record<string, string | number | null>>("SELECT name, city, due_day FROM societies WHERE id=?", [s.id])!;
+    run("UPDATE societies SET name=?, city=?, due_day=? WHERE id=?", [d.name.trim(), d.city.trim(), d.dueDay, s.id]);
+    audit("edit", "society", s.id, diff(before, { name: d.name.trim(), city: d.city.trim(), due_day: d.dueDay }));
+  });
+  await save();
+}
+
+export interface FlatInput { building: string; flat_no: string; owner_name: string; mobile: string; whatsapp: string; occupancy: string; maintenance_paise: number; exempt: boolean }
+
+export async function updateFlat(id: number, d: FlatInput) {
+  if (!d.flat_no.trim() || !d.owner_name.trim()) throw new Error("Flat number and owner name are required.");
+  tx(() => {
+    const before = one<Record<string, string | number | null>>(
+      "SELECT building, flat_no, owner_name, mobile, whatsapp, occupancy, monthly_maintenance_paise, penalty_exempt FROM flats WHERE id=?", [id])!;
+    const after = { building: d.building.trim(), flat_no: d.flat_no.trim(), owner_name: d.owner_name.trim(), mobile: d.mobile.trim(), whatsapp: d.whatsapp.trim(),
+      occupancy: d.occupancy, monthly_maintenance_paise: d.maintenance_paise, penalty_exempt: d.exempt ? 1 : 0 };
+    run(`UPDATE flats SET building=?, flat_no=?, owner_name=?, mobile=?, whatsapp=?, occupancy=?, monthly_maintenance_paise=?, penalty_exempt=? WHERE id=?`,
+      [after.building, after.flat_no, after.owner_name, after.mobile, after.whatsapp, after.occupancy, after.monthly_maintenance_paise, after.penalty_exempt, id]);
+    if (before.owner_name !== after.owner_name) { // ownership change: keep the previous owner in the history
+      run("UPDATE ownership_history SET to_date=? WHERE flat_id=? AND to_date IS NULL", [today(), id]);
+      run("INSERT INTO ownership_history (flat_id, owner_name, from_date) VALUES (?,?,?)", [id, after.owner_name, today()]);
+    }
+    audit("edit", "flat", id, diff(before, after));
+  });
+  await save();
+}
+
+/** Hides the flat from lists and future billing. Its bills, payments and history stay in the records. */
+export async function removeFlat(id: number) {
+  tx(() => { run("UPDATE flats SET active=0 WHERE id=?", [id]); audit("remove", "flat", id); });
+  await save();
+}
+
+/** Recalculates the stored penalty and the penalty share of each payment after any bill or payment edit.
+ *  Throws (and the caller's transaction rolls back) if the payments would exceed what is due. */
+function reassess(s: Society, billId: number) {
+  const row = one<BillRow>(`${BILL_SQL} WHERE b.id=?`, [billId]);
+  if (!row) throw new Error("Bill not found.");
+  const principal = row.maintenance_paise + row.extra_paise;
+  const pays = all<{ id: number; paid_on: string; amount_paise: number }>(
+    "SELECT id, paid_on, amount_paise FROM payments WHERE bill_id=? AND status='verified' ORDER BY paid_on, id", [billId]);
+  let penalty = 0, detail = "";
+  if (pays.length > 0) {
+    let cum = 0, asOf = pays[pays.length - 1].paid_on;
+    for (const p of pays) { cum += p.amount_paise; if (principal > 0 && cum >= principal) { asOf = p.paid_on; break; } }
+    const calc = calculatePenalty({
+      principalPaise: principal - row.ontime_paid, dueDate: row.due_date, paidDate: asOf,
+      config: penaltyConfig(s), exempt: !!row.penalty_exempt, waivedPaise: row.penalty_waived_paise,
+    });
+    penalty = calc.penaltyPaise; detail = `${calc.detail} (assessed on ${asOf})`;
+  }
+  const paid = pays.reduce((a, p) => a + p.amount_paise, 0);
+  if (paid > principal + penalty) throw new Error("The payments recorded would be more than the amount due on this bill.");
+  run("UPDATE bills SET penalty_paise=?, penalty_detail=? WHERE id=?", [penalty, detail, billId]);
+  let cum = 0;
+  for (const p of pays) {
+    const part = Math.max(0, Math.min(p.amount_paise, cum + p.amount_paise - principal));
+    cum += p.amount_paise;
+    run("UPDATE payments SET penalty_part_paise=? WHERE id=?", [part, p.id]);
+  }
+}
+
+export async function updateBill(s: Society, billId: number, d: { maintenancePaise: number; extraPaise: number; waivedPaise: number }) {
+  if (d.maintenancePaise < 0 || d.extraPaise < 0 || d.waivedPaise < 0) throw new Error("Amounts cannot be negative.");
+  tx(() => {
+    const before = one<Record<string, number>>("SELECT maintenance_paise, extra_paise, penalty_waived_paise FROM bills WHERE id=?", [billId])!;
+    run("UPDATE bills SET maintenance_paise=?, extra_paise=?, penalty_waived_paise=? WHERE id=?", [d.maintenancePaise, d.extraPaise, d.waivedPaise, billId]);
+    reassess(s, billId);
+    audit("edit", "bill", billId, diff(before, { maintenance_paise: d.maintenancePaise, extra_paise: d.extraPaise, penalty_waived_paise: d.waivedPaise }));
+  });
+  await save();
+}
+
+export interface PaymentRow {
+  id: number; bill_id: number; receipt_no: string; paid_on: string; amount_paise: number; mode: string; reference: string | null;
+  note: string | null; reverses_payment_id: number | null; reversed: number; flat_no: string; building: string; owner_name: string;
+}
+
+export const listPayments = (s: Society, year: number, month: number) =>
+  all<PaymentRow>(
+    `SELECT p.*, EXISTS (SELECT 1 FROM payments r WHERE r.reverses_payment_id = p.id) AS reversed, f.flat_no, f.building, f.owner_name
+     FROM payments p JOIN bills b ON b.id=p.bill_id JOIN flats f ON f.id=b.flat_id
+     WHERE p.society_id=? AND b.year=? AND b.month=? ORDER BY p.paid_on DESC, p.id DESC`, [s.id, year, month]);
+
+export async function updatePayment(s: Society, id: number, d: { paidOn: string; amountPaise: number; mode: string; reference: string; note: string }) {
+  if (!(d.amountPaise > 0)) throw new Error("Enter an amount greater than zero.");
+  try {
+    tx(() => {
+      const before = one<{ bill_id: number; paid_on: string; amount_paise: number; mode: string; reference: string | null; note: string | null; reverses_payment_id: number | null }>(
+        "SELECT * FROM payments WHERE id=?", [id]);
+      if (!before) throw new Error("Payment not found.");
+      if (before.reverses_payment_id !== null) throw new Error("A cancellation entry cannot be edited.");
+      if (one("SELECT id FROM payments WHERE reverses_payment_id=?", [id])) throw new Error("This payment was cancelled and cannot be edited.");
+      run("UPDATE payments SET paid_on=?, amount_paise=?, mode=?, reference=?, note=? WHERE id=?",
+        [d.paidOn, d.amountPaise, d.mode, d.reference.trim() || null, d.note, id]);
+      reassess(s, before.bill_id);
+      audit("edit", "payment", id, diff(before, { paid_on: d.paidOn, amount_paise: d.amountPaise, mode: d.mode, reference: d.reference.trim() || null, note: d.note }));
+    });
+  } catch (e) {
+    if (e instanceof Error && e.message.includes("UNIQUE") && e.message.includes("reference")) throw new Error("This payment reference has already been recorded.");
+    throw e;
+  }
+  await save();
+}
+
+/** For a payment entered against the wrong bill or flat: cancel it and record the right one. */
+export async function cancelPayment(s: Society, id: number, reason: string) {
+  if (!reason.trim()) throw new Error("Enter the reason for cancelling.");
+  tx(() => {
+    const p = one<{ bill_id: number; receipt_no: string; amount_paise: number; mode: string; reverses_payment_id: number | null }>("SELECT * FROM payments WHERE id=?", [id]);
+    if (!p) throw new Error("Payment not found.");
+    if (p.reverses_payment_id !== null) throw new Error("This is already a cancellation entry.");
+    const seq = one<{ n: number }>("SELECT COUNT(*) AS n FROM payments WHERE society_id=?", [s.id])!.n + 1;
+    run(`INSERT INTO payments (society_id, bill_id, receipt_no, paid_on, amount_paise, mode, reverses_payment_id, note, entered_by)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
+      [s.id, p.bill_id, `C${today().slice(0, 4)}-${String(seq).padStart(5, "0")}`, today(), -p.amount_paise, p.mode, id, `Cancelled ${p.receipt_no}: ${reason.trim()}`, "admin"]);
+    reassess(s, p.bill_id);
+    audit("cancel", "payment", id, reason.trim());
+  });
+  await save();
+}
+
+export async function updateExpense(id: number, d: ExpenseInput, society: Society) {
+  if (!(d.amountPaise > 0)) throw new Error("Enter an amount greater than zero.");
+  tx(() => {
+    const before = one<{ txn_date: string; category: string; description: string | null; vendor_id: number | null; invoice_no: string | null; amount_paise: number; mode: string | null; reference: string | null; reverses_id: number | null; approval: string }>(
+      "SELECT * FROM income_expense WHERE id=? AND kind='expense'", [id]);
+    if (!before) throw new Error("Expense not found.");
+    if (before.reverses_id !== null) throw new Error("A reversal entry cannot be edited.");
+    if (one("SELECT id FROM income_expense WHERE reverses_id=?", [id])) throw new Error("This expense was reversed and cannot be edited.");
+    let vendorId: number | null = null;
+    const name = d.vendor.trim();
+    if (name) {
+      const v = one<{ id: number }>("SELECT id FROM vendors WHERE society_id=? AND LOWER(name)=LOWER(?)", [society.id, name]);
+      if (v) vendorId = v.id; else { run("INSERT INTO vendors (society_id, name) VALUES (?,?)", [society.id, name]); vendorId = lastId(); }
+    }
+    // A changed expense goes back for approval, so an approved figure cannot be altered unnoticed.
+    run(`UPDATE income_expense SET txn_date=?, category=?, description=?, vendor_id=?, invoice_no=?, amount_paise=?, mode=?, reference=?, approval='pending', approved_by=NULL WHERE id=?`,
+      [d.date, d.category, d.description.trim(), vendorId, d.invoiceNo.trim(), d.amountPaise, d.mode, d.reference.trim(), id]);
+    audit("edit", "expense", id, diff(before, { txn_date: d.date, category: d.category, description: d.description.trim(), vendor_id: vendorId, invoice_no: d.invoiceNo.trim(), amount_paise: d.amountPaise, mode: d.mode, reference: d.reference.trim() }));
+  });
+  await save();
+}
+
+export const billParts = (billId: number) => {
+  const r = one<{ maintenance_paise: number; extra_paise: number; penalty_waived_paise: number }>(
+    "SELECT maintenance_paise, extra_paise, penalty_waived_paise FROM bills WHERE id=?", [billId])!;
+  return { maintenance: r.maintenance_paise, extra: r.extra_paise, waived: r.penalty_waived_paise };
+};
+
+// ---------------------------------------------------------------- Messages
+
+/** What each flat owes today across all months, including the penalty up to today. */
+export function flatDues(s: Society): Map<number, { balance: number; months: string }> {
+  const out = new Map<number, { balance: number; months: string[] }>();
+  const rows = all<BillRow>(`${BILL_SQL} WHERE b.society_id=? ORDER BY b.year, b.month`, [s.id]);
+  for (const r of rows) {
+    const b = view(r, s, today());
+    if (b.balance <= 0) continue;
+    const e = out.get(b.flat_id) ?? { balance: 0, months: [] };
+    e.balance += b.balance;
+    e.months.push(`${MONTHS_EN[b.month - 1]} ${b.year}`);
+    out.set(b.flat_id, e);
+  }
+  return new Map([...out].map(([k, v]) => [k, { balance: v.balance, months: v.months.join(", ") }]));
+}
+
+export async function logMessage(societyId: number, flatId: number, kind: string, number: string, body: string) {
+  run("INSERT INTO message_log (society_id, flat_id, kind, to_number, body) VALUES (?,?,?,?,?)", [societyId, flatId, kind, number, body]);
+  await save();
+}
+
+export const listMessageLog = (societyId: number, limit = 40) =>
+  all<{ id: number; at: string; kind: string; body: string; building: string | null; flat_no: string | null; owner_name: string | null }>(
+    `SELECT m.id, m.at, m.kind, m.body, f.building, f.flat_no, f.owner_name FROM message_log m LEFT JOIN flats f ON f.id=m.flat_id
+     WHERE m.society_id=? ORDER BY m.id DESC LIMIT ?`, [societyId, limit]);

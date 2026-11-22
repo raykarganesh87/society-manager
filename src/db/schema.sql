@@ -117,9 +117,10 @@ CREATE INDEX IF NOT EXISTS ix_bills_flat ON bills (flat_id, year, month);
 CREATE INDEX IF NOT EXISTS ix_payments_bill ON payments (bill_id);
 CREATE INDEX IF NOT EXISTS ix_flats_search ON flats (society_id, flat_no, owner_name, mobile);
 
--- Payments and ledger rows cannot be changed or deleted once written.
-CREATE TRIGGER IF NOT EXISTS payments_no_update BEFORE UPDATE ON payments
-BEGIN SELECT RAISE(ABORT, 'Payments cannot be edited. Add a reversal entry instead.'); END;
+-- Payments and ledger rows can be corrected (with an audit trail) but never deleted.
+DROP TRIGGER IF EXISTS payments_no_update;
+CREATE TRIGGER IF NOT EXISTS payments_fixed_fields BEFORE UPDATE OF id, society_id, bill_id, receipt_no, reverses_payment_id, created_at ON payments
+BEGIN SELECT RAISE(ABORT, 'Receipt number, bill and link to the original payment cannot be changed.'); END;
 CREATE TRIGGER IF NOT EXISTS payments_no_delete BEFORE DELETE ON payments
 BEGIN SELECT RAISE(ABORT, 'Payments cannot be deleted. Add a reversal entry instead.'); END;
 CREATE TRIGGER IF NOT EXISTS ledger_no_delete BEFORE DELETE ON income_expense
@@ -135,6 +136,21 @@ INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '1');
 CREATE UNIQUE INDEX IF NOT EXISTS ux_ie_voucher ON income_expense (society_id, voucher_no) WHERE voucher_no IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS ux_ie_reversal ON income_expense (reverses_id) WHERE reverses_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS ix_ie_date ON income_expense (society_id, kind, txn_date);
--- Only the approval status may change on a ledger row. Amount, date, category and so on are fixed once saved.
-CREATE TRIGGER IF NOT EXISTS ledger_fixed_fields BEFORE UPDATE OF kind, txn_date, voucher_no, category, description, vendor_id, invoice_no, amount_paise, mode, reference, reverses_id ON income_expense
-BEGIN SELECT RAISE(ABORT, 'Expense details cannot be edited. Reverse the entry and add a new one.'); END;
+-- Expense details can be edited (the change is written to the audit log). Identity fields are fixed.
+DROP TRIGGER IF EXISTS ledger_fixed_fields;
+CREATE TRIGGER IF NOT EXISTS ledger_identity_fixed BEFORE UPDATE OF id, society_id, kind, voucher_no, reverses_id ON income_expense
+BEGIN SELECT RAISE(ABORT, 'Voucher number and the link to the original entry cannot be changed.'); END;
+
+-- History of messages opened in WhatsApp. "Sent" means the message was opened and ready in WhatsApp;
+-- the app cannot see whether the person pressed Send or whether it was delivered.
+CREATE TABLE IF NOT EXISTS message_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  society_id INTEGER NOT NULL REFERENCES societies(id),
+  flat_id INTEGER REFERENCES flats(id),
+  channel TEXT NOT NULL DEFAULT 'whatsapp',
+  kind TEXT NOT NULL,
+  to_number TEXT,
+  body TEXT NOT NULL,
+  at TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS ix_message_log_at ON message_log (society_id, at);
