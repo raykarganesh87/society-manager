@@ -2,10 +2,10 @@ import { useEffect, useState } from "react";
 import { openDb } from "./db/db";
 import { getSociety, Society } from "./db/services";
 import { makeT, Lang } from "./lib/i18n";
-import { Setup, Dashboard, FlatsScreen, BillingScreen, BackupScreen, RulesScreen, ExpensesScreen } from "./screens";
+import { Setup, Dashboard, FlatsScreen, BillingScreen, BackupScreen, RulesScreen, ExpensesScreen, SocietyDetails, MessagesScreen } from "./screens";
 
-type Tab = "dashboard" | "flats" | "billing" | "expenses" | "rules" | "backup";
-const TABS: Tab[] = ["dashboard", "flats", "billing", "expenses", "rules", "backup"];
+type Tab = "dashboard" | "flats" | "billing" | "expenses" | "messages" | "rules" | "backup";
+const TABS: Tab[] = ["dashboard", "flats", "billing", "expenses", "messages", "rules", "backup"];
 
 export default function App() {
   const [ready, setReady] = useState(false);
@@ -47,7 +47,8 @@ export default function App() {
             {tab === "flats" && <FlatsScreen t={t} society={society} onChange={refresh} />}
             {tab === "billing" && <BillingScreen t={t} society={society} onChange={refresh} />}
             {tab === "expenses" && <ExpensesScreen t={t} society={society} onChange={refresh} />}
-            {tab === "rules" && <RulesScreen t={t} society={society} onChange={refresh} />}
+            {tab === "messages" && <MessagesScreen t={t} lang={lang} society={society} />}
+            {tab === "rules" && <><SocietyDetails t={t} society={society} onChange={refresh} /><RulesScreen t={t} society={society} onChange={refresh} /></>}
             {tab === "backup" && <BackupScreen t={t} onRestored={refresh} />}
           </main>
           <nav className="tabs">
