@@ -1,8 +1,7 @@
 // Windows desktop shell. The database file is stored in the user's AppData folder (app.getPath("userData")).
-const { app, BrowserWindow, ipcMain, dialog, protocol, net, Menu } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, protocol, Menu, shell } = require("electron");
 const path = require("path");
 const fs = require("fs");
-const { pathToFileURL } = require("url");
 
 protocol.registerSchemesAsPrivileged([
   { scheme: "app", privileges: { standard: true, secure: true, supportFetchAPI: true } },
@@ -17,16 +16,22 @@ function createWindow() {
     webPreferences: { preload: path.join(__dirname, "preload.cjs"), contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
   Menu.setApplicationMenu(null);
+  // WhatsApp links open in WhatsApp / the default browser. Nothing else may open.
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https:\/\/(wa\.me|api\.whatsapp\.com)\//.test(url)) shell.openExternal(url);
+    return { action: "deny" };
+  });
   win.loadURL("app://local/index.html");
 }
 
 app.whenReady().then(() => {
   const dist = path.join(__dirname, "..", "dist");
-  protocol.handle("app", (req) => {
+  // Electron 22 (the last version that runs on Windows 7/8/8.1/10/11) serves app:// files like this.
+  protocol.registerFileProtocol("app", (req, callback) => {
     const rel = decodeURIComponent(new URL(req.url).pathname).replace(/^\/+/, "") || "index.html";
     const file = path.normalize(path.join(dist, rel));
-    if (!file.startsWith(dist)) return new Response("Not found", { status: 404 });
-    return net.fetch(pathToFileURL(file).toString());
+    if (!file.startsWith(dist)) return callback({ error: -6 });
+    callback({ path: file });
   });
 
   ipcMain.handle("db:read", async (_e, name) => {
