@@ -67,3 +67,16 @@ jobs:
       - run: npm run dist:win
       - uses: actions/upload-artifact@v7
         with: { name: windows-installer, path: release/*.exe }
+
+  web-single-file:
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with: { node-version: 20 }
+      - run: npm install
+      - run: npm run build:single
+      - run: mv dist-single/index.html SocietyManager.html
+      - uses: actions/upload-artifact@v7
+        with: { name: single-html-file, path: SocietyManager.html }
